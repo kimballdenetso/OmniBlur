@@ -15,12 +15,12 @@
                      // needs revisiting.
 
 #define NAME            "OmniBlur"
-#define DESCRIPTION        "v1.0.1 Separate blur"
+#define DESCRIPTION        "v1.0.3 Metal GPU scaffold (unverified)"
 #define MAJOR_VERSION    1
 #define MINOR_VERSION    0
-#define BUG_VERSION        0
+#define BUG_VERSION        3
 #define STAGE_VERSION    PF_Stage_DEVELOP
-#define BUILD_VERSION    2 // remind user to increment when starting work again
+#define BUILD_VERSION    6 // remind user to increment when starting work again
 
 enum {
     OMNIBLUR_INPUT = 0,
@@ -31,6 +31,56 @@ enum {
 #define RADIUS_MIN        0
 #define RADIUS_MAX        50
 #define RADIUS_DFLT        5
+
+// --- Metal GPU support -----------------------------------------------------
+// Everything below marked VERIFY is scaffolding based on Adobe's SDK_Invert_ProcAmp
+// sample pattern, not confirmed against this project's actual SDK headers yet.
+// Same approach as PF_WorldSuite1 earlier: type `->` in Xcode and let autocomplete
+// confirm the real field/method names before trusting this.
+
+#include <Metal/Metal.h>
+// VERIFY: the kernel below is written in Adobe's cross-platform GF_KERNEL_FUNCTION
+// DSL. In the sample project this macro-based kernel source lives in its own file
+// (translated at build time into CUDA/OpenCL/Metal via the Boost-based build step),
+// NOT inline in the main .cpp. Where exactly it needs to live in OmniBlur's build
+// setup still needs to be confirmed by looking at how SDK_Invert_ProcAmp's project
+// file wires up its own kernel file -- left here for now so the logic is visible.
+//
+// GF_KERNEL_FUNCTION(BoxBlurKernel,
+//     ((const GF_PTR(float4))(inSrc))
+//     ((GF_PTR(float4))(outDst)),
+//     ((int)(inSrcPitch))
+//     ((int)(inDstPitch))
+//     ((int)(inWidth))
+//     ((int)(inHeight))
+//     ((int)(inRadius))
+//     ((int)(inHorizontal)),
+//     ((uint2)(inXY)(KERNEL_XY)))
+// {
+//     if (inXY.x < inWidth && inXY.y < inHeight)
+//     {
+//         float4 sum = {0.0f, 0.0f, 0.0f, 0.0f};
+//         int count = 0;
+//         for (int d = -inRadius; d <= inRadius; d++)
+//         {
+//             int sx = inHorizontal ? (int)inXY.x + d : (int)inXY.x;
+//             int sy = inHorizontal ? (int)inXY.y     : (int)inXY.y + d;
+//             if (sx < 0 || sx >= inWidth || sy < 0 || sy >= inHeight) continue;
+//             float4 pixel = ReadFloat4(inSrc, sy * inSrcPitch + sx, 0);
+//             sum.x += pixel.x; sum.y += pixel.y; sum.z += pixel.z; sum.w += pixel.w;
+//             count++;
+//         }
+//         if (count > 0) { sum.x /= count; sum.y /= count; sum.z /= count; sum.w /= count; }
+//         WriteFloat4(sum, outDst, inXY.y * inDstPitch + inXY.x, 0);
+//     }
+// }
+
+// GPU data initialized in GPUDeviceSetup, used during SmartRenderGPU, released in
+// GPUDeviceSetdown. VERIFY: mirrors the sample's MetalGPUData struct pattern.
+struct OmniBlurMetalGPUData
+{
+    id<MTLComputePipelineState> blur_pipeline;
+};
 
 static PF_Err
 About(PF_InData *in_data, PF_OutData *out_data, PF_ParamDef *params[], PF_LayerDef *output)
@@ -46,6 +96,13 @@ GlobalSetup(PF_InData *in_data, PF_OutData *out_data, PF_ParamDef *params[], PF_
 {
     out_data->my_version = PF_VERSION(MAJOR_VERSION, MINOR_VERSION, BUG_VERSION, STAGE_VERSION, BUILD_VERSION);
     out_data->out_flags = PF_OutFlag_DEEP_COLOR_AWARE;
+    // SUPPORTS_SMART_RENDER is the prerequisite flag for the whole Smart FX pipeline --
+    // GPU rendering (Metal on Mac) is only reachable through Smart Render, not the
+    // classic PF_Cmd_RENDER path. Once this is set, AE sends PF_Cmd_SMART_PRE_RENDER +
+    // PF_Cmd_SMART_RENDER instead (on hosts that support it). Keeping PF_Cmd_RENDER
+    // implemented too, below, as a fallback for older/non-smart hosts.
+    out_data->out_flags2 = PF_OutFlag2_SUPPORTS_SMART_RENDER
+                          | PF_OutFlag2_SUPPORTS_GPU_RENDER_F32; // required to be offered GPU rendering at all
     return PF_Err_NONE;
 }
 
@@ -61,13 +118,13 @@ ParamsSetup(PF_InData *in_data, PF_OutData *out_data, PF_ParamDef *params[], PF_
     return PF_Err_NONE;
 }
 
+// Does the actual two-pass separable box blur, input -> output. Pulled out of Render()
+// as its own function so both the classic PF_Cmd_RENDER path and the new Smart Render
+// path (below) can share it -- neither has to change when the blur algorithm changes.
 static PF_Err
-Render(PF_InData *in_data, PF_OutData *out_data, PF_ParamDef *params[], PF_LayerDef *output)
+DoBlur(PF_InData *in_data, A_long radius, PF_EffectWorld *input, PF_EffectWorld *output)
 {
     PF_Err err = PF_Err_NONE;
-
-    A_long radius = params[OMNIBLUR_RADIUS]->u.sd.value;
-    PF_EffectWorld *input = &params[OMNIBLUR_INPUT]->u.ld;
 
     A_long width = output->width;
     A_long height = output->height;
@@ -172,6 +229,193 @@ Render(PF_InData *in_data, PF_OutData *out_data, PF_ParamDef *params[], PF_Layer
     return err;
 }
 
+// Fallback entry point for hosts that don't support Smart FX. Modern AE will use
+// SmartPreRender/SmartRender below instead once SUPPORTS_SMART_RENDER is set.
+static PF_Err
+Render(PF_InData *in_data, PF_OutData *out_data, PF_ParamDef *params[], PF_LayerDef *output)
+{
+    A_long radius = params[OMNIBLUR_RADIUS]->u.sd.value;
+    PF_EffectWorld *input = &params[OMNIBLUR_INPUT]->u.ld;
+    return DoBlur(in_data, radius, input, output);
+}
+
+// PF_Cmd_SMART_PRE_RENDER: tell AE what part of the input we need, and how big the
+// output will be. Because a blur reads neighboring pixels, we have to grow the
+// requested input rect by `radius` in every direction, or edge pixels of the visible
+// frame will blur using out-of-bounds/garbage data.
+static PF_Err
+PreRender(PF_InData *in_data, PF_OutData *out_data, PF_PreRenderExtra *extra)
+{
+    PF_Err err = PF_Err_NONE;
+    PF_RenderRequest req = extra->input->output_request;
+    PF_CheckoutResult in_result;
+
+    PF_ParamDef radius_param;
+    AEFX_CLR_STRUCT(radius_param);
+    ERR(PF_CHECKOUT_PARAM(in_data, OMNIBLUR_RADIUS, in_data->current_time,
+                           in_data->time_step, in_data->time_scale, &radius_param));
+    A_long radius = err ? 0 : radius_param.u.sd.value;
+
+    req.rect.left   -= radius;
+    req.rect.top    -= radius;
+    req.rect.right  += radius;
+    req.rect.bottom += radius;
+    req.preserve_rgb_of_zero_alpha = TRUE;
+
+    ERR(extra->cb->checkout_layer(in_data->effect_ref,
+                                   OMNIBLUR_INPUT,
+                                   OMNIBLUR_INPUT,
+                                   &req,
+                                   in_data->current_time,
+                                   in_data->time_step,
+                                   in_data->time_scale,
+                                   &in_result));
+
+    if (!err) {
+        extra->output->result_rect     = in_result.result_rect;
+        extra->output->max_result_rect = in_result.max_result_rect;
+        extra->output->solid           = FALSE;
+        extra->output->pre_render_data = NULL;
+    }
+
+    return err;
+}
+
+// PF_Cmd_SMART_RENDER: the Smart FX counterpart of the old Render(). Checks out the
+// input/output worlds it declared in PreRender and runs the same DoBlur() as the
+// classic path. This is also the function that will branch to a GPU/Metal dispatch
+// once that's wired up -- for now it's CPU-only, same math as before, just reached
+// through the Smart FX door instead of the classic one.
+static PF_Err
+SmartRender(PF_InData *in_data, PF_OutData *out_data, PF_SmartRenderExtra *extra)
+{
+    PF_Err err = PF_Err_NONE;
+    PF_EffectWorld *input_worldP = NULL;
+    PF_EffectWorld *output_worldP = NULL;
+
+    ERR(extra->cb->checkout_layer_pixels(in_data->effect_ref, OMNIBLUR_INPUT, &input_worldP));
+    ERR(extra->cb->checkout_output(in_data->effect_ref, &output_worldP));
+
+    if (!err && input_worldP && output_worldP) {
+        PF_ParamDef radius_param;
+        AEFX_CLR_STRUCT(radius_param);
+        ERR(PF_CHECKOUT_PARAM(in_data, OMNIBLUR_RADIUS, in_data->current_time,
+                               in_data->time_step, in_data->time_scale, &radius_param));
+        A_long radius = err ? 0 : radius_param.u.sd.value;
+
+        ERR(DoBlur(in_data, radius, input_worldP, output_worldP));
+    }
+
+    ERR(extra->cb->checkin_layer_pixels(in_data->effect_ref, OMNIBLUR_INPUT));
+
+    return err;
+}
+
+// PF_Cmd_GPU_DEVICE_SETUP: sets up the Metal compute pipeline once per device, ahead
+// of any render. VERIFY every field/method below against Xcode autocomplete on
+// PF_GPUDeviceSetupExtra and PF_GPUDeviceInfo -- names below follow the sample
+// project's pattern but are not confirmed for this SDK version.
+static PF_Err
+GPUDeviceSetup(PF_InData *in_data, PF_OutData *out_data, PF_GPUDeviceSetupExtra *extra)
+{
+    PF_Err err = PF_Err_NONE;
+
+    // VERIFY: field name for which GPU framework AE handed us (CUDA/OpenCL/Metal).
+    if (extra->input->what_gpu != PF_GPU_Framework_METAL) {
+        // Not Metal (e.g. host chose CUDA/OpenCL on another platform) -- decline GPU
+        // render for this device so AE falls back to the CPU SmartRender path.
+        out_data->out_flags2 &= ~PF_OutFlag2_SUPPORTS_GPU_RENDER_F32;
+        return err;
+    }
+
+    // CONFIRMED via Xcode autocomplete: PF_GPUDeviceSetupInput only has device_index
+    // and what_gpu -- no device pointer field. The actual MTLDevice has to come from
+    // a suite call keyed on device_index, same pattern as PF_WorldSuite1 earlier.
+    A_u_long device_index = extra->input->device_index;
+    id<MTLDevice> device = nil; // TODO: fetch real device via GPU device suite call
+    (void)device_index;
+
+    NSString *source = [NSString stringWithUTF8String:
+        /* VERIFY: compiled/generated Metal source or a loaded .metallib -- the sample
+           uses a build-time-generated header (see the kernel comment above) rather
+           than a raw string; this is a placeholder until that's wired up. */
+        ""];
+
+    NSError *nsErr = nil;
+    id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&nsErr];
+    id<MTLFunction> blurFn = [library newFunctionWithName:@"BoxBlurKernel"];
+
+    OmniBlurMetalGPUData *metal_data = new OmniBlurMetalGPUData();
+    metal_data->blur_pipeline = [device newComputePipelineStateWithFunction:blurFn error:&nsErr];
+
+    // VERIFY: correct way to stash metal_data for retrieval in SmartRenderGPU --
+    // the sample keys this off extra->output->gpu_data or similar, not shown here
+    // with confidence.
+    extra->output->gpu_data = (void*)metal_data;
+
+    return err;
+}
+
+// PF_Cmd_GPU_DEVICE_SETDOWN: release what GPUDeviceSetup allocated.
+static PF_Err
+GPUDeviceSetdown(PF_InData *in_data, PF_OutData *out_data, PF_GPUDeviceSetdownExtra *extra)
+{
+    // VERIFY: field name to retrieve back the gpu_data stashed in setup.
+    OmniBlurMetalGPUData *metal_data = (OmniBlurMetalGPUData*)extra->input->gpu_data;
+    delete metal_data;
+    return PF_Err_NONE;
+}
+
+// PF_Cmd_SMART_RENDER_GPU: GPU counterpart of SmartRender. Checks out GPU-resident
+// worlds (source, an intermediate buffer for the pass-1 -> pass-2 handoff, and
+// destination) and dispatches BoxBlurKernel twice -- horizontal then vertical --
+// mirroring DoBlur()'s two CPU passes exactly, just running on the GPU.
+// VERIFY: every checkout/world-access call below against the sample's
+// SmartRenderGPU -- this is the least-confident section of the whole file.
+static PF_Err
+SmartRenderGPU(PF_InData *in_data, PF_OutData *out_data, PF_SmartRenderExtra *extra)
+{
+    PF_Err err = PF_Err_NONE;
+
+    // VERIFY: retrieving the OmniBlurMetalGPUData stashed during GPUDeviceSetup.
+    OmniBlurMetalGPUData *metal_data = (OmniBlurMetalGPUData*)extra->input->gpu_data;
+
+    PF_EffectWorld *input_worldP = NULL;
+    PF_EffectWorld *output_worldP = NULL;
+    ERR(extra->cb->checkout_layer_pixels(in_data->effect_ref, OMNIBLUR_INPUT, &input_worldP));
+    ERR(extra->cb->checkout_output(in_data->effect_ref, &output_worldP));
+
+    // VERIFY: need an intermediate GPU world for the horizontal-pass output, same
+    // role as `temp` in DoBlur() -- sample calls checkout an extra GPU buffer via
+    // its GPU device suite rather than PF_WorldSuite1 (that's a CPU-only suite).
+
+    if (!err && input_worldP && output_worldP) {
+        PF_ParamDef radius_param;
+        AEFX_CLR_STRUCT(radius_param);
+        ERR(PF_CHECKOUT_PARAM(in_data, OMNIBLUR_RADIUS, in_data->current_time,
+                               in_data->time_step, in_data->time_scale, &radius_param));
+        A_long radius = err ? 0 : radius_param.u.sd.value;
+
+        // VERIFY: obtaining the command queue/buffer and dispatching, e.g.:
+        // id<MTLCommandQueue> queue = ...;
+        // id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+        // id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+        // [encoder setComputePipelineState:metal_data->blur_pipeline];
+        // [encoder setBuffer:(id<MTLBuffer>)input_worldP->... offset:0 atIndex:0];
+        // [encoder setBuffer:(id<MTLBuffer>)intermediate... offset:0 atIndex:1];
+        // ... set inRadius, inHorizontal=1, dispatch, then a second dispatch with
+        // inHorizontal=0 reading intermediate -> output_worldP ...
+        // [encoder endEncoding];
+        // [commandBuffer commit];
+        (void)radius;
+        (void)metal_data;
+    }
+
+    ERR(extra->cb->checkin_layer_pixels(in_data->effect_ref, OMNIBLUR_INPUT));
+
+    return err;
+}
+
 // ---------------------------------------------------------------------------
 // THIS FUNCTION WAS MISSING AND WAS THE ROOT CAUSE of the plugin not appearing
 // in AE's Effect Manager. EffectMain alone is not enough -- AE calls
@@ -232,6 +476,21 @@ PF_Err EffectMain(
                 break;
             case PF_Cmd_RENDER:
                 err = Render(in_data, out_data, params, output);
+                break;
+            case PF_Cmd_SMART_PRE_RENDER:
+                err = PreRender(in_data, out_data, reinterpret_cast<PF_PreRenderExtra*>(extra));
+                break;
+            case PF_Cmd_SMART_RENDER:
+                err = SmartRender(in_data, out_data, reinterpret_cast<PF_SmartRenderExtra*>(extra));
+                break;
+            case PF_Cmd_GPU_DEVICE_SETUP:
+                err = GPUDeviceSetup(in_data, out_data, reinterpret_cast<PF_GPUDeviceSetupExtra*>(extra));
+                break;
+            case PF_Cmd_GPU_DEVICE_SETDOWN:
+                err = GPUDeviceSetdown(in_data, out_data, reinterpret_cast<PF_GPUDeviceSetdownExtra*>(extra));
+                break;
+            case PF_Cmd_SMART_RENDER_GPU:
+                err = SmartRenderGPU(in_data, out_data, reinterpret_cast<PF_SmartRenderExtra*>(extra));
                 break;
         }
     } catch (PF_Err &thrown_err) {

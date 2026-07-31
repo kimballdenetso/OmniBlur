@@ -5,9 +5,12 @@ OmniBlur is an After Effects plugin built with the Adobe AE SDK (ae25.6_61.64bit
 
 ## Current Status (POC)
 - Plugin registers correctly in AE's Effect Manager via `PluginDataEntryFunction2`
-- **Separable box blur implemented in `Render()`** — horizontal pass then vertical pass via an intermediate scratch `PF_EffectWorld`, replacing the original O(radius²) nested-loop blur with O(radius) per pixel
+- **Separable box blur implemented** — horizontal pass then vertical pass via an intermediate scratch `PF_EffectWorld`, replacing the original O(radius²) nested-loop blur with O(radius) per pixel. Pulled out of `Render()` into a standalone `DoBlur(in_data, radius, input, output)` helper so both the classic and Smart FX render paths can share it.
+- **Converted from classic render architecture to Smart FX.** Added `PF_OutFlag2_SUPPORTS_SMART_RENDER` in `GlobalSetup`, plus `PreRender()` (`PF_Cmd_SMART_PRE_RENDER`) and `SmartRender()` (`PF_Cmd_SMART_RENDER`). `PreRender` grows the requested input checkout rect by `radius` in every direction so edge pixels don't blur against out-of-bounds data. Classic `Render()` kept as a fallback for non-Smart hosts, calling the same `DoBlur` helper. **Build succeeded, edge blurring confirmed correct.** This was the necessary prerequisite for GPU rendering — Metal isn't reachable through the classic Render path.
+- **Metal GPU rendering: in progress.** Added `PF_OutFlag2_SUPPORTS_GPU_RENDER_F32` in `GlobalSetup`, plus scaffolding for `GPUDeviceSetup` (`PF_Cmd_GPU_DEVICE_SETUP`), `GPUDeviceSetdown` (`PF_Cmd_GPU_DEVICE_SETDOWN`), and `SmartRenderGPU` (`PF_Cmd_SMART_RENDER_GPU`), dispatched from `EffectMain`. Confirmed via Xcode autocomplete that `PF_GPUDeviceSetupInput` only exposes `device_index` (`A_u_long`) and `what_gpu` — no direct device pointer field. Still need: the actual suite call (off `AEGP_SuiteHandler`, same pattern as `PF_WorldSuite1`) that turns `device_index` into a real `MTLDevice`; proper build-time wiring for the kernel source (Adobe's SDK uses a `GF_KERNEL_FUNCTION`-based DSL translated into CUDA/OpenCL/Metal at build time, not raw inline Metal source); and the actual two-pass (horizontal/vertical) kernel dispatch in `SmartRenderGPU`, currently commented out as a sketch.
 - Radius slider works (`PF_ADD_SLIDER`, read via `params[OMNIBLUR_RADIUS]->u.sd.value`)
 - Deep color aware flag set (`PF_OutFlag_DEEP_COLOR_AWARE`)
+- Current build: v1.0.3, build 6
 - **Git + GitHub connected** (repo: `github.com/kimballdenetso/OmniBlur`, public, `main` branch). Set up via Terminal rather than Xcode's Source Control UI. Notable gotchas from setup, worth remembering if repeating this for another project:
   - The `Mac` subfolder (containing the actual `.xcodeproj`) had accidentally been initialized as its own nested git repo at some point — git treats a folder containing its own `.git` as an embedded repo/gitlink, not as regular tracked files, which silently breaks clones. Fix was `rm -rf Mac/.git` before adding it to the outer repo.
   - `.gitignore` needs `build/` (no leading slash, matches at any depth) to exclude Xcode's build output — the default entries alone (`DerivedData/`, `xcuserdata/`) don't catch it, since this project's build folder is just named `build/`.
@@ -28,7 +31,11 @@ OmniBlur is an After Effects plugin built with the Adobe AE SDK (ae25.6_61.64bit
 
 ## Remaining Known Issues
 - **Bit depth**: still 8-bit only (`PF_Pixel8`); no 16/32-bit path yet
-- **No Metal/GPU acceleration yet** — separable blur is the CPU-side interim win
+- **Metal/GPU acceleration**: scaffolding in place (see above), not yet functional. Specifically still open:
+  - The suite call to convert `device_index` into a real `MTLDevice` (confirmed it's not a struct field on `PF_GPUDeviceSetupInput`)
+  - Where the `GF_KERNEL_FUNCTION`-based kernel source actually needs to live in this project's build setup for the CUDA/OpenCL/Metal translation step to pick it up
+  - The real two-pass (horizontal/vertical) `MTLComputeCommandEncoder` dispatch in `SmartRenderGPU` — currently a commented-out sketch, not real calls
+  - How `gpu_data` (the struct holding the compiled Metal pipeline state) is actually stashed between `GPUDeviceSetup` and retrieved in `SmartRenderGPU`/`GPUDeviceSetdown`
 
 ## Architecture Notes
 - Entry point: `EffectMain`, dispatches on `PF_Cmd` (ABOUT, GLOBAL_SETUP, PARAMS_SETUP, RENDER)
@@ -40,11 +47,14 @@ OmniBlur is an After Effects plugin built with the Adobe AE SDK (ae25.6_61.64bit
 
 ## Roadmap
 
-### 1. Performance: Metal GPU Rendering
+### 1. Performance: Metal GPU Rendering — **IN PROGRESS**
 - Move render path from CPU (`PF_EffectWorld` pixel loops) to a Metal compute shader
 - Requires: Metal device/command queue setup, bridging `PF_EffectWorld` data to `MTLTexture`/`MTLBuffer`, compute pipeline state, threadgroup dispatch sized to frame dimensions
-- Consider `PF_OutFlag2_SUPPORTS_GPU_RENDER_F32` / Smart Render pipeline (may require converting from classic to Smart FX architecture — worth confirming before deep Metal work)
+- ~~Consider `PF_OutFlag2_SUPPORTS_GPU_RENDER_F32` / Smart Render pipeline (may require converting from classic to Smart FX architecture — worth confirming before deep Metal work)~~ **DONE** — Smart FX conversion complete and verified working; `SUPPORTS_GPU_RENDER_F32` flag added
 - ~~Interim CPU win before Metal lands: separable blur (horizontal pass then vertical pass) to cut box blur from O(r²) to O(r) per pixel~~ **DONE**
+- Confirmed: the `MTLDevice` is not a direct field on `PF_GPUDeviceSetupInput` (only `device_index`/`what_gpu` are) — reaching it requires a suite call, same "fetch via `AEGP_SuiteHandler`, not `in_data->utils`" pattern documented under Known Issues Resolved below. Next: identify the exact GPU device suite accessor via Xcode autocomplete on `suites.`
+- Reference: Adobe's `SDK_Invert_ProcAmp` sample implements this full pipeline (CUDA/OpenCL/Metal) and is the intended template to cross-check field/method names against, rather than guessing from SDK docs alone
+- Kernel logic is written once using Adobe's `GF_KERNEL_FUNCTION` macro DSL and auto-translated into CUDA/OpenCL/Metal at build time (via the same Boost toolchain already in use for this project) — not three hand-written kernels
 
 ### 2. Bit Depth Support: 16-bit and 32-bit
 - Currently 8-bit only (`PF_Pixel8`)
@@ -66,10 +76,11 @@ OmniBlur is an After Effects plugin built with the Adobe AE SDK (ae25.6_61.64bit
 
 ## Suggested Build Order
 1. ~~Separable blur (quick CPU perf win, low risk)~~ **DONE**
-2. Metal compute shader for box blur (validates the GPU pipeline before adding algorithm complexity)
-3. 16/32-bit support (extend the now-working Metal path across bit depths)
-4. Additional blur algorithms (fast blur, lens blur) built on top of the working GPU pipeline
-5. Luma-based blur map (layered on top, since it modulates whichever algorithm is active)
+2. ~~Convert classic render architecture to Smart FX (prerequisite for GPU rendering)~~ **DONE** — build succeeded, edge blurring confirmed correct
+3. Metal compute shader for box blur (validates the GPU pipeline before adding algorithm complexity) — **IN PROGRESS**: `GPUDeviceSetup`/`GPUDeviceSetdown`/`SmartRenderGPU` scaffolded and wired into `EffectMain`; still need the device suite call, kernel build wiring, and the actual two-pass dispatch
+4. 16/32-bit support (extend the now-working Metal path across bit depths)
+5. Additional blur algorithms (fast blur, lens blur) built on top of the working GPU pipeline
+6. Luma-based blur map (layered on top, since it modulates whichever algorithm is active)
 
 ## Tooling
 - Xcode (Apple Silicon), AE SDK ae25.6_61.64bit
