@@ -15,12 +15,12 @@
                      // needs revisiting.
 
 #define NAME            "OmniBlur"
-#define DESCRIPTION        "v1.0.3 Metal GPU scaffold (unverified)"
+#define DESCRIPTION        "v1.0.3 Metal Conversion"
 #define MAJOR_VERSION    1
 #define MINOR_VERSION    0
 #define BUG_VERSION        3
 #define STAGE_VERSION    PF_Stage_DEVELOP
-#define BUILD_VERSION    6 // remind user to increment when starting work again
+#define BUILD_VERSION    8 // remind user to increment when starting work again
 
 enum {
     OMNIBLUR_INPUT = 0,
@@ -39,6 +39,8 @@ enum {
 // confirm the real field/method names before trusting this.
 
 #include <Metal/Metal.h>
+#include "OmniBlur_Kernel.metal.h"
+#include "AE_EffectGPUSuites.h"
 // VERIFY: the kernel below is written in Adobe's cross-platform GF_KERNEL_FUNCTION
 // DSL. In the sample project this macro-based kernel source lives in its own file
 // (translated at build time into CUDA/OpenCL/Metal via the Boost-based build step),
@@ -332,15 +334,17 @@ GPUDeviceSetup(PF_InData *in_data, PF_OutData *out_data, PF_GPUDeviceSetupExtra 
     // and what_gpu -- no device pointer field. The actual MTLDevice has to come from
     // a suite call keyed on device_index, same pattern as PF_WorldSuite1 earlier.
     A_u_long device_index = extra->input->device_index;
-    id<MTLDevice> device = nil; // TODO: fetch real device via GPU device suite call
-    (void)device_index;
 
-    NSString *source = [NSString stringWithUTF8String:
-        /* VERIFY: compiled/generated Metal source or a loaded .metallib -- the sample
-           uses a build-time-generated header (see the kernel comment above) rather
-           than a raw string; this is a placeholder until that's wired up. */
-        ""];
+    AEGP_SuiteHandler suites(in_data->pica_basicP);
+    PF_GPUDeviceSuite1 *gpu_suiteP = suites.GPUDeviceSuite1(); // VERIFY exact accessor name via Xcode autocomplete, same as WorldSuite1 earlier
 
+    PF_GPUDeviceInfo device_info;
+    ERR(gpu_suiteP->GetDeviceInfo(in_data->effect_ref, device_index, &device_info));
+
+    id<MTLDevice> device = err ? nil : (__bridge id<MTLDevice>)device_info.devicePV;
+
+    NSString *source = [NSString stringWithUTF8String: kOmniBlur_Kernel_MetalString];
+    
     NSError *nsErr = nil;
     id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&nsErr];
     id<MTLFunction> blurFn = [library newFunctionWithName:@"BoxBlurKernel"];
