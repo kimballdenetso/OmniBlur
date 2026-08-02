@@ -15,12 +15,12 @@
                      // needs revisiting.
 
 #define NAME            "OmniBlur"
-#define DESCRIPTION        "v1.0.3 Metal Conversion (crash fix 2)"
+#define DESCRIPTION        "v1.0.3 GPU Dispatch"
 #define MAJOR_VERSION    1
 #define MINOR_VERSION    0
 #define BUG_VERSION        3
 #define STAGE_VERSION    PF_Stage_DEVELOP
-#define BUILD_VERSION    13 // remind user to increment when starting work again
+#define BUILD_VERSION    15 // remind user to increment when starting work again
 
 enum {
     OMNIBLUR_INPUT = 0,
@@ -77,6 +77,22 @@ enum {
 //         WriteFloat4(sum, outDst, inXY.y * inDstPitch + inXY.x, 0);
 //     }
 // }
+
+// Mirrors the real generated Metal struct BoxBlurKernelValues -- CONFIRMED by reading
+// the actual dumped kernel source (not guessed). Field order/types must match exactly
+// since this gets bound as raw bytes at buffer index 2. Note in16f exists in the real
+// kernel even though the old placeholder sketch above didn't have it -- the real
+// OmniBlur_Kernel.cu has since diverged from that sketch.
+struct BoxBlurKernelValues
+{
+    int inSrcPitch;
+    int inDstPitch;
+    int in16f;
+    unsigned int inWidth;
+    unsigned int inHeight;
+    int inRadius;
+    int inHorizontal;
+};
 
 // GPU data initialized in GPUDeviceSetup, used during SmartRenderGPU, released in
 // GPUDeviceSetdown. VERIFY: mirrors the sample's MetalGPUData struct pattern.
@@ -426,30 +442,132 @@ SmartRenderGPU(PF_InData *in_data, PF_OutData *out_data, PF_SmartRenderExtra *ex
     ERR(extra->cb->checkout_layer_pixels(in_data->effect_ref, OMNIBLUR_INPUT, &input_worldP));
     ERR(extra->cb->checkout_output(in_data->effect_ref, &output_worldP));
 
-    // VERIFY: need an intermediate GPU world for the horizontal-pass output, same
-    // role as `temp` in DoBlur() -- sample calls checkout an extra GPU buffer via
-    // its GPU device suite rather than PF_WorldSuite1 (that's a CPU-only suite).
+    // Intermediate GPU-resident world for the horizontal-pass output, same role as
+    // `temp` in DoBlur(). DoBlur's scratch buffer comes from PF_WorldSuite1::new_world,
+    // but that suite is CPU-only -- the GPU equivalent is PF_GPUDeviceSuite1's
+    // CreateGPUWorld/DisposeGPUWorld pair, same suite we already added an accessor for
+    // to fix GPUDeviceSetup earlier.
+    // CONFIRMED via Xcode jump-to-definition: CreateGPUWorld/DisposeGPUWorld's real
+    // signatures. DisposeGPUWorld only takes (effect_ref, worldP) -- the 2-arg call
+    // below was already right. CreateGPUWorld needed 5 more args than the earlier
+    // guess: pixel_aspect_ratio, field_type, and a clear_pixB flag, on top of
+    // width/height/pixel_format.
+    AEGP_SuiteHandler suites(in_data->pica_basicP);
+    PF_GPUDeviceSuite1 *gpu_suiteP = suites.GPUDeviceSuite1();
+    A_u_long device_index = extra->input->device_index; // VERIFY: field name/existence on PF_SmartRenderExtra's input -- not yet confirmed the same way CreateGPUWorld/DisposeGPUWorld now are
 
+    PF_EffectWorld *intermediate_worldP = NULL;
     if (!err && input_worldP && output_worldP) {
+        ERR(gpu_suiteP->CreateGPUWorld(
+                in_data->effect_ref,
+                device_index,
+                input_worldP->width,
+                input_worldP->height,
+                in_data->pixel_aspect_ratio, // VERIFY: PF_InData does carry pixel_aspect_ratio, but confirm it's populated the same way on the SmartRenderGPU path as it is elsewhere
+                PF_Field_FRAME, // scratch buffer, not a final delivered frame -- no interlacing to preserve here; VERIFY this constant name
+                PF_PixelFormat_GPU_BGRA128, // CONFIRMED via Xcode jump-to-definition: GPU, BGRA, 32-bit float per channel -- matches the F32-only GPU support we declared (PF_OutFlag2_SUPPORTS_GPU_RENDER_F32)
+                FALSE, // clear_pixB -- skip the clear; the horizontal pass is about to write every in-bounds pixel anyway, so pre-clearing is wasted work. Flip to TRUE if edge pixels ever look uninitialized.
+                &intermediate_worldP));
+    }
+
+    if (!err && input_worldP && output_worldP && intermediate_worldP) {
         PF_ParamDef radius_param;
         AEFX_CLR_STRUCT(radius_param);
         ERR(PF_CHECKOUT_PARAM(in_data, OMNIBLUR_RADIUS, in_data->current_time,
                                in_data->time_step, in_data->time_scale, &radius_param));
         A_long radius = err ? 0 : radius_param.u.sd.value;
 
-        // VERIFY: obtaining the command queue/buffer and dispatching, e.g.:
-        // id<MTLCommandQueue> queue = ...;
-        // id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
-        // id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
-        // [encoder setComputePipelineState:metal_data->blur_pipeline];
-        // [encoder setBuffer:(id<MTLBuffer>)input_worldP->... offset:0 atIndex:0];
-        // [encoder setBuffer:(id<MTLBuffer>)intermediate... offset:0 atIndex:1];
-        // ... set inRadius, inHorizontal=1, dispatch, then a second dispatch with
-        // inHorizontal=0 reading intermediate -> output_worldP ...
-        // [encoder endEncoding];
-        // [commandBuffer commit];
-        (void)radius;
+        // Real dispatch, replacing the earlier commented-out sketch. Structure:
+        // pull each world's real GPU buffer via GetGPUWorldData, pack the scalar
+        // params into a BoxBlurKernelValues struct per pass, dispatch horizontal
+        // (input -> intermediate) then vertical (intermediate -> output).
+        if (!err) {
+            @autoreleasepool {
+                void *inputPixP = NULL, *intermediatePixP = NULL, *outputPixP = NULL;
+                ERR(gpu_suiteP->GetGPUWorldData(in_data->effect_ref, input_worldP, &inputPixP));
+                ERR(gpu_suiteP->GetGPUWorldData(in_data->effect_ref, intermediate_worldP, &intermediatePixP));
+                ERR(gpu_suiteP->GetGPUWorldData(in_data->effect_ref, output_worldP, &outputPixP));
+
+                if (!err) {
+                    // VERIFY: bridging a raw pixPP straight to id<MTLBuffer> -- not
+                    // explicitly confirmed for this call, but follows the same
+                    // __bridge pattern already confirmed correct twice for
+                    // device_info.devicePV and command_queuePV in GPUDeviceSetup.
+                    id<MTLBuffer> inputBuf = (__bridge id<MTLBuffer>)inputPixP;
+                    id<MTLBuffer> intermediateBuf = (__bridge id<MTLBuffer>)intermediatePixP;
+                    id<MTLBuffer> outputBuf = (__bridge id<MTLBuffer>)outputPixP;
+
+                    // VERIFY: pitch units. PF_EffectWorld::rowbytes is normally in
+                    // bytes; the kernel indexes by float4 (16-byte) elements, so this
+                    // divides by 16 to get a per-row element stride. If the blurred
+                    // result comes out sheared or offset per row, this conversion is
+                    // the first thing to re-check.
+                    int input_pitch = input_worldP->rowbytes / 16;
+                    int intermediate_pitch = intermediate_worldP->rowbytes / 16;
+                    int output_pitch = output_worldP->rowbytes / 16;
+
+                    id<MTLCommandBuffer> commandBuffer = [metal_data->command_queue commandBuffer];
+                    id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+                    [encoder setComputePipelineState:metal_data->blur_pipeline];
+
+                    MTLSize threadsPerGrid = MTLSizeMake((NSUInteger)input_worldP->width,
+                                                          (NSUInteger)input_worldP->height, 1);
+                    NSUInteger tw = metal_data->blur_pipeline.threadExecutionWidth;
+                    NSUInteger th = metal_data->blur_pipeline.maxTotalThreadsPerThreadgroup / tw;
+                    MTLSize threadsPerThreadgroup = MTLSizeMake(tw, th, 1);
+
+                    // Pass 1: horizontal, input -> intermediate
+                    BoxBlurKernelValues values = {};
+                    values.inSrcPitch = input_pitch;
+                    values.inDstPitch = intermediate_pitch;
+                    values.in16f = 0; // VERIFY: assumed 0 means "not 16-bit half-float" -- we only declared F32 GPU support, so this should be the correct/only value we ever need
+                    values.inWidth = (unsigned int)input_worldP->width;
+                    values.inHeight = (unsigned int)input_worldP->height;
+                    values.inRadius = (int)radius;
+                    values.inHorizontal = 1;
+
+                    [encoder setBuffer:inputBuf offset:0 atIndex:0];
+                    [encoder setBuffer:intermediateBuf offset:0 atIndex:1];
+                    [encoder setBytes:&values length:sizeof(values) atIndex:2];
+                    [encoder dispatchThreads:threadsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
+
+                    // Two dispatches in the same encoder reading/writing the same
+                    // buffers need an explicit barrier -- Metal does NOT auto-sync
+                    // successive dispatchThreads calls within one encoder. Without
+                    // this, pass 2 can start reading `intermediate` before pass 1
+                    // finished writing it.
+                    [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+                    // Pass 2: vertical, intermediate -> output
+                    values.inSrcPitch = intermediate_pitch;
+                    values.inDstPitch = output_pitch;
+                    values.inHorizontal = 0;
+
+                    [encoder setBuffer:intermediateBuf offset:0 atIndex:0];
+                    [encoder setBuffer:outputBuf offset:0 atIndex:1];
+                    [encoder setBytes:&values length:sizeof(values) atIndex:2];
+                    [encoder dispatchThreads:threadsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
+
+                    [encoder endEncoding];
+                    [commandBuffer commit];
+                }
+            }
+        }
         (void)metal_data;
+    }
+
+    // Dispose the intermediate world whenever it was created, regardless of what
+    // failed afterward -- same reasoning as the !err guards in GPUDeviceSetup: don't
+    // let a mid-render failure leak the GPU buffer. Written out manually (rather than
+    // an ERR2-style macro) since ERR2 isn't confirmed to exist in this SDK's
+    // Param_Utils.h. This preserves an earlier error code instead of overwriting it
+    // with the disposal result. CONFIRMED via Xcode jump-to-definition: DisposeGPUWorld
+    // really does only take (effect_ref, worldP) -- no fix needed here.
+    if (intermediate_worldP) {
+        PF_Err dispose_err = gpu_suiteP->DisposeGPUWorld(in_data->effect_ref, intermediate_worldP);
+        if (!err) {
+            err = dispose_err;
+        }
     }
 
     ERR(extra->cb->checkin_layer_pixels(in_data->effect_ref, OMNIBLUR_INPUT));
