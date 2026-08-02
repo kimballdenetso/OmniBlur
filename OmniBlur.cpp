@@ -15,12 +15,12 @@
                      // needs revisiting.
 
 #define NAME            "OmniBlur"
-#define DESCRIPTION        "v1.0.3 Metal Conversion"
+#define DESCRIPTION        "v1.0.3 Metal Conversion (crash fix 2)"
 #define MAJOR_VERSION    1
 #define MINOR_VERSION    0
 #define BUG_VERSION        3
 #define STAGE_VERSION    PF_Stage_DEVELOP
-#define BUILD_VERSION    8 // remind user to increment when starting work again
+#define BUILD_VERSION    13 // remind user to increment when starting work again
 
 enum {
     OMNIBLUR_INPUT = 0,
@@ -39,6 +39,7 @@ enum {
 // confirm the real field/method names before trusting this.
 
 #include <Metal/Metal.h>
+#include <os/log.h>
 #include "OmniBlur_Kernel.metal.h"
 #include "AE_EffectGPUSuites.h"
 // VERIFY: the kernel below is written in Adobe's cross-platform GF_KERNEL_FUNCTION
@@ -82,6 +83,7 @@ enum {
 struct OmniBlurMetalGPUData
 {
     id<MTLComputePipelineState> blur_pipeline;
+    id<MTLCommandQueue> command_queue; // wasn't being stashed anywhere before -- needed once SmartRenderGPU dispatches for real
 };
 
 static PF_Err
@@ -339,23 +341,58 @@ GPUDeviceSetup(PF_InData *in_data, PF_OutData *out_data, PF_GPUDeviceSetupExtra 
     PF_GPUDeviceSuite1 *gpu_suiteP = suites.GPUDeviceSuite1(); // VERIFY exact accessor name via Xcode autocomplete, same as WorldSuite1 earlier
 
     PF_GPUDeviceInfo device_info;
+    AEFX_CLR_STRUCT(device_info); // wasn't zeroed before -- matches the pattern used everywhere else in this file
     ERR(gpu_suiteP->GetDeviceInfo(in_data->effect_ref, device_index, &device_info));
 
-    id<MTLDevice> device = err ? nil : (__bridge id<MTLDevice>)device_info.devicePV;
+    // Everything below touches real Metal objects, and Metal's validation layer
+    // hard-crashes the process (not a catchable error) if you hand it a nil
+    // MTLFunction/MTLDevice. This used to run unconditionally even when GetDeviceInfo
+    // failed -- that's almost certainly what was crashing AE. Guard the whole block.
+    if (!err) {
+        @autoreleasepool {
+            id<MTLDevice> device = (__bridge id<MTLDevice>)device_info.devicePV;
 
-    NSString *source = [NSString stringWithUTF8String: kOmniBlur_Kernel_MetalString];
-    
-    NSError *nsErr = nil;
-    id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&nsErr];
-    id<MTLFunction> blurFn = [library newFunctionWithName:@"BoxBlurKernel"];
+            if (!device) {
+                err = PF_Err_INTERNAL_STRUCT_DAMAGED;
+            } else {
+                NSString *source = [NSString stringWithUTF8String: kOmniBlur_Kernel_MetalString];
 
-    OmniBlurMetalGPUData *metal_data = new OmniBlurMetalGPUData();
-    metal_data->blur_pipeline = [device newComputePipelineStateWithFunction:blurFn error:&nsErr];
+                NSError *nsErr = nil;
+                id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&nsErr];
+                if (!library) {
+                    // Shader failed to compile. Console.app redacts NSError text in %@ by
+                    // default (shows "<private>") -- use os_log with %{public}@ to force it
+                    // to actually show. Also dump the source we tried to compile straight to
+                    // disk so it can be inspected (or fed to `xcrun metal` directly) without
+                    // fighting log redaction at all.
+                    os_log_error(OS_LOG_DEFAULT, "OmniBlur: Metal shader compile failed: %{public}@", nsErr);
+                    NSError *writeErr = nil;
+                    NSString *dumpPath = @"/tmp/OmniBlur_generated_kernel.metal";
+                    [source writeToFile:dumpPath atomically:YES encoding:NSUTF8StringEncoding error:&writeErr];
+                    os_log_error(OS_LOG_DEFAULT, "OmniBlur: wrote generated shader source to %{public}@", dumpPath);
+                    err = PF_Err_INTERNAL_STRUCT_DAMAGED;
+                } else {
+                    id<MTLFunction> blurFn = [library newFunctionWithName:@"BoxBlurKernel"];
+                    if (!blurFn) {
+                        os_log_error(OS_LOG_DEFAULT, "OmniBlur: BoxBlurKernel function not found in compiled library");
+                        err = PF_Err_INTERNAL_STRUCT_DAMAGED;
+                    } else {
+                        OmniBlurMetalGPUData *metal_data = new OmniBlurMetalGPUData();
+                        metal_data->blur_pipeline = [device newComputePipelineStateWithFunction:blurFn error:&nsErr];
 
-    // VERIFY: correct way to stash metal_data for retrieval in SmartRenderGPU --
-    // the sample keys this off extra->output->gpu_data or similar, not shown here
-    // with confidence.
-    extra->output->gpu_data = (void*)metal_data;
+                        if (!metal_data->blur_pipeline) {
+                            os_log_error(OS_LOG_DEFAULT, "OmniBlur: pipeline state creation failed: %{public}@", nsErr);
+                            delete metal_data;
+                            err = PF_Err_INTERNAL_STRUCT_DAMAGED;
+                        } else {
+                            metal_data->command_queue = (__bridge id<MTLCommandQueue>)device_info.command_queuePV;
+                            extra->output->gpu_data = (void*)metal_data;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     return err;
 }
