@@ -15,12 +15,12 @@
                      // needs revisiting.
 
 #define NAME            "OmniBlur"
-#define DESCRIPTION        "v1.0.3 GPU Dispatch"
+#define DESCRIPTION        "v1.0.4 16/32 bit support"
 #define MAJOR_VERSION    1
 #define MINOR_VERSION    0
 #define BUG_VERSION        3
 #define STAGE_VERSION    PF_Stage_DEVELOP
-#define BUILD_VERSION    15 // remind user to increment when starting work again
+#define BUILD_VERSION    16 // remind user to increment when starting work again
 
 enum {
     OMNIBLUR_INPUT = 0,
@@ -42,6 +42,8 @@ enum {
 #include <os/log.h>
 #include "OmniBlur_Kernel.metal.h"
 #include "AE_EffectGPUSuites.h"
+#include <type_traits>
+
 // VERIFY: the kernel below is written in Adobe's cross-platform GF_KERNEL_FUNCTION
 // DSL. In the sample project this macro-based kernel source lives in its own file
 // (translated at build time into CUDA/OpenCL/Metal via the Boost-based build step),
@@ -122,7 +124,9 @@ GlobalSetup(PF_InData *in_data, PF_OutData *out_data, PF_ParamDef *params[], PF_
     // PF_Cmd_SMART_RENDER instead (on hosts that support it). Keeping PF_Cmd_RENDER
     // implemented too, below, as a fallback for older/non-smart hosts.
     out_data->out_flags2 = PF_OutFlag2_SUPPORTS_SMART_RENDER
-                          | PF_OutFlag2_SUPPORTS_GPU_RENDER_F32; // required to be offered GPU rendering at all
+                          | PF_OutFlag2_SUPPORTS_GPU_RENDER_F32
+                          | PF_OutFlag2_FLOAT_COLOR_AWARE;
+    
     return PF_Err_NONE;
 }
 
@@ -141,8 +145,9 @@ ParamsSetup(PF_InData *in_data, PF_OutData *out_data, PF_ParamDef *params[], PF_
 // Does the actual two-pass separable box blur, input -> output. Pulled out of Render()
 // as its own function so both the classic PF_Cmd_RENDER path and the new Smart Render
 // path (below) can share it -- neither has to change when the blur algorithm changes.
+template <typename PixelT>
 static PF_Err
-DoBlur(PF_InData *in_data, A_long radius, PF_EffectWorld *input, PF_EffectWorld *output)
+DoBlurTyped(PF_InData *in_data, A_long radius, PF_EffectWorld *input, PF_EffectWorld *output)
 {
     PF_Err err = PF_Err_NONE;
 
@@ -152,9 +157,9 @@ DoBlur(PF_InData *in_data, A_long radius, PF_EffectWorld *input, PF_EffectWorld 
     // Fast path: no blur requested, just copy input -> output and bail.
     if (radius <= 0) {
         for (A_long y = 0; y < height; y++) {
-            PF_Pixel8 *inRow = reinterpret_cast<PF_Pixel8*>(
+            PixelT *inRow = reinterpret_cast<PixelT*>(
                 reinterpret_cast<char*>(input->data) + y * input->rowbytes);
-            PF_Pixel8 *outRow = reinterpret_cast<PF_Pixel8*>(
+            PixelT *outRow = reinterpret_cast<PixelT*>(
                 reinterpret_cast<char*>(output->data) + y * output->rowbytes);
             for (A_long x = 0; x < width; x++) {
                 outRow[x] = inRow[x];
@@ -170,30 +175,47 @@ DoBlur(PF_InData *in_data, A_long radius, PF_EffectWorld *input, PF_EffectWorld 
 
     AEGP_SuiteHandler suites(in_data->pica_basicP);
     PF_WorldSuite1 *wsP = suites.WorldSuite1();
-
-    ERR(wsP->new_world(
-        in_data->effect_ref,           // PF_ProgPtr ✓
-        width,                         // A_long ✓
-        height,                        // A_long ✓
-        PF_NewWorldFlag_CLEAR_PIXELS,  // PF_NewWorldFlags ✓
-        &temp));                       // PF_EffectWorld* ✓
+    PF_WorldSuite2 *wsP2 = suites.PFWorldSuite2();
+    
+    PF_NewWorldFlags flags = PF_NewWorldFlag_CLEAR_PIXELS;
+    if (std::is_same<PixelT, PF_Pixel16>::value) {
+        flags |= PF_NewWorldFlag_DEEP_PIXELS;
+    }
+    
+    if (std::is_same<PixelT, PF_PixelFloat>::value) {
+        ERR(wsP2->PF_NewWorld(
+            in_data->effect_ref,
+            width,
+            height,
+            TRUE,
+            PF_PixelFormat_ARGB128,
+            &temp));
+    } else {
+        ERR(wsP->new_world(
+            in_data->effect_ref,
+            width,
+            height,
+            flags,
+            &temp));
+    }
 
     if (!err) {
         // ---- PASS 1: horizontal blur, input -> temp ----
         for (A_long y = 0; y < height; y++) {
-            PF_Pixel8 *inRow = reinterpret_cast<PF_Pixel8*>(
+            PixelT *inRow = reinterpret_cast<PixelT*>(
                 reinterpret_cast<char*>(input->data) + y * input->rowbytes);
-            PF_Pixel8 *tempRow = reinterpret_cast<PF_Pixel8*>(
+            PixelT *tempRow = reinterpret_cast<PixelT*>(
                 reinterpret_cast<char*>(temp.data) + y * temp.rowbytes);
 
             for (A_long x = 0; x < width; x++) {
-                long rSum = 0, gSum = 0, bSum = 0, aSum = 0, count = 0;
+                double rSum = 0, gSum = 0, bSum = 0, aSum = 0;
+                A_long count = 0;
 
                 for (A_long dx = -radius; dx <= radius; dx++) {
                     A_long sx = x + dx;
                     if (sx < 0 || sx >= input->width) continue;
 
-                    PF_Pixel8 *pixP = inRow + sx;
+                    PixelT *pixP = inRow + sx;
                     aSum += pixP->alpha;
                     rSum += pixP->red;
                     gSum += pixP->green;
@@ -202,29 +224,30 @@ DoBlur(PF_InData *in_data, A_long radius, PF_EffectWorld *input, PF_EffectWorld 
                 }
 
                 if (count > 0) {
-                    tempRow[x].alpha = static_cast<A_u_char>(aSum / count);
-                    tempRow[x].red   = static_cast<A_u_char>(rSum / count);
-                    tempRow[x].green = static_cast<A_u_char>(gSum / count);
-                    tempRow[x].blue  = static_cast<A_u_char>(bSum / count);
+                    tempRow[x].alpha = static_cast<decltype(PixelT::alpha)>(aSum / count);
+                    tempRow[x].red   = static_cast<decltype(PixelT::red)>(rSum / count);
+                    tempRow[x].green = static_cast<decltype(PixelT::green)>(gSum / count);
+                    tempRow[x].blue  = static_cast<decltype(PixelT::blue)>(bSum / count);
                 }
             }
         }
 
         // ---- PASS 2: vertical blur, temp -> output ----
         for (A_long y = 0; y < height; y++) {
-            PF_Pixel8 *outRow = reinterpret_cast<PF_Pixel8*>(
+            PixelT *outRow = reinterpret_cast<PixelT*>(
                 reinterpret_cast<char*>(output->data) + y * output->rowbytes);
 
             for (A_long x = 0; x < width; x++) {
-                long rSum = 0, gSum = 0, bSum = 0, aSum = 0, count = 0;
+                double rSum = 0, gSum = 0, bSum = 0, aSum = 0;
+                A_long count = 0;
 
                 for (A_long dy = -radius; dy <= radius; dy++) {
                     A_long sy = y + dy;
                     if (sy < 0 || sy >= temp.height) continue;
 
-                    PF_Pixel8 *tempRow = reinterpret_cast<PF_Pixel8*>(
+                    PixelT *tempRow = reinterpret_cast<PixelT*>(
                         reinterpret_cast<char*>(temp.data) + sy * temp.rowbytes);
-                    PF_Pixel8 *pixP = tempRow + x;
+                    PixelT *pixP = tempRow + x;
 
                     aSum += pixP->alpha;
                     rSum += pixP->red;
@@ -234,10 +257,10 @@ DoBlur(PF_InData *in_data, A_long radius, PF_EffectWorld *input, PF_EffectWorld 
                 }
 
                 if (count > 0) {
-                    outRow[x].alpha = static_cast<A_u_char>(aSum / count);
-                    outRow[x].red   = static_cast<A_u_char>(rSum / count);
-                    outRow[x].green = static_cast<A_u_char>(gSum / count);
-                    outRow[x].blue  = static_cast<A_u_char>(bSum / count);
+                    outRow[x].alpha = static_cast<decltype(PixelT::alpha)>(aSum / count);
+                    outRow[x].red   = static_cast<decltype(PixelT::red)>(rSum / count);
+                    outRow[x].green = static_cast<decltype(PixelT::green)>(gSum / count);
+                    outRow[x].blue  = static_cast<decltype(PixelT::blue)>(bSum / count);
                 }
             }
         }
@@ -249,6 +272,16 @@ DoBlur(PF_InData *in_data, A_long radius, PF_EffectWorld *input, PF_EffectWorld 
     return err;
 }
 
+static PF_Err
+DoBlur(PF_InData *in_data, A_long bitdepth, A_long radius, PF_EffectWorld *input, PF_EffectWorld *output)
+{
+    switch (bitdepth) {
+        case 16: return DoBlurTyped<PF_Pixel16>(in_data, radius, input, output);
+        case 32: return DoBlurTyped<PF_PixelFloat>(in_data, radius, input, output);
+        default: return DoBlurTyped<PF_Pixel8>(in_data, radius, input, output);
+    }
+}
+
 // Fallback entry point for hosts that don't support Smart FX. Modern AE will use
 // SmartPreRender/SmartRender below instead once SUPPORTS_SMART_RENDER is set.
 static PF_Err
@@ -256,8 +289,7 @@ Render(PF_InData *in_data, PF_OutData *out_data, PF_ParamDef *params[], PF_Layer
 {
     A_long radius = params[OMNIBLUR_RADIUS]->u.sd.value;
     PF_EffectWorld *input = &params[OMNIBLUR_INPUT]->u.ld;
-    return DoBlur(in_data, radius, input, output);
-}
+    return DoBlur(in_data, 8, radius, input, output);}
 
 // PF_Cmd_SMART_PRE_RENDER: tell AE what part of the input we need, and how big the
 // output will be. Because a blur reads neighboring pixels, we have to grow the
@@ -322,8 +354,9 @@ SmartRender(PF_InData *in_data, PF_OutData *out_data, PF_SmartRenderExtra *extra
         ERR(PF_CHECKOUT_PARAM(in_data, OMNIBLUR_RADIUS, in_data->current_time,
                                in_data->time_step, in_data->time_scale, &radius_param));
         A_long radius = err ? 0 : radius_param.u.sd.value;
+        A_long bitdepth = extra->input->bitdepth;
 
-        ERR(DoBlur(in_data, radius, input_worldP, output_worldP));
+        ERR(DoBlur(in_data, bitdepth, radius, input_worldP, output_worldP));
     }
 
     ERR(extra->cb->checkin_layer_pixels(in_data->effect_ref, OMNIBLUR_INPUT));
