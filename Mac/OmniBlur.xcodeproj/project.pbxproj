@@ -18,18 +18,6 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXBuildRule section */
-		6FB3105D301D8760007C8F38 /* PBXBuildRule */ = {
-			isa = PBXBuildRule;
-			compilerSpec = com.apple.compilers.proxy.script;
-			filePatterns = .cl;
-			fileType = pattern.proxy;
-			inputFiles = (
-			);
-			isEditable = 1;
-			outputFiles = (
-			);
-			script = "set -x\n\nmkdir -p ${DERIVED_FILE_DIR}/64/PreprocessedMetal/\nchmod 777 ${DERIVED_FILE_DIR}/64/PreprocessedMetal/\n/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang -E -x c -I\"${GPUUTILS_BASE_PATH}\" -I\"${BOOST_BASE_PATH}\" -I\"${METAL_STUB_HEADERS_PATH}\" -DGF_DEVICE_TARGET_METAL=1 -o ${DERIVED_FILE_DIR}/64/PreprocessedMetal/${INPUT_FILE_BASE}.i \"${INPUT_FILE_PATH}\"\n\npython3 \"${GPUUTILS_BASE_PATH}\"/CreateCString.py -i ${DERIVED_FILE_DIR}/64/PreprocessedMetal/${INPUT_FILE_BASE}.i -o ${DERIVED_FILE_DIR}/64/PreprocessedMetal/${INPUT_FILE_BASE}.metal.h --name k${INPUT_FILE_BASE}_MetalString\n\nmkdir -p ${DERIVED_FILE_DIR}/64/PreprocessedOpenCL/\nchmod 777 ${DERIVED_FILE_DIR}/64/PreprocessedOpenCL/\n/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang -E -x c -I\"${GPUUTILS_BASE_PATH}\" -I\"${BOOST_BASE_PATH}\" -DGF_DEVICE_TARGET_OPENCL=1 -o ${DERIVED_FILE_DIR}/64/PreprocessedOpenCL/${INPUT_FILE_BASE}.i \"${INPUT_FILE_PATH}\"\n\npython3 \"${GPUUTILS_BASE_PATH}\"/CreateCString.py -i ${DERIVED_FILE_DIR}/64/PreprocessedOpenCL/${INPUT_FILE_BASE}.i -o ${DERIVED_FILE_DIR}/64/PreprocessedOpenCL/${INPUT_FILE_BASE}.cl.h --name k${INPUT_FILE_BASE}_OpenCLString\n";
-		};
 		A1565A53211B6C0B00070361 /* PBXBuildRule */ = {
 			isa = PBXBuildRule;
 			compilerSpec = com.apple.compilers.proxy.script;
@@ -158,7 +146,6 @@
 				C4E618EA095A3E040012CA3F /* Rez */,
 			);
 			buildRules = (
-				6FB3105D301D8760007C8F38 /* PBXBuildRule */,
 				A1565A53211B6C0B00070361 /* PBXBuildRule */,
 			);
 			dependencies = (

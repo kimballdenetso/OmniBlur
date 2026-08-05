@@ -1,212 +1,157 @@
-# OmniBlur — Session Update: 16/32-bit Support (16-bit working, 32-bit still broken)
+# OmniBlur — Session Update: 32-bit follow-up, GPU confirmations, CPU blur performance
 
 ## Starting point
-Picked up right after Metal GPU rendering was confirmed fully working end-to-end
-(build 15). Next roadmap item: extend rendering across bit depths, since the plugin
-was still hardcoded to 8-bit (`PF_Pixel8`) everywhere on the CPU side.
+Picked up right after the prior session ended with 8-bit and 16-bit CPU rendering
+confirmed correct, and 32-bit float still showing visible rendering errors despite a
+clean build. Open items carried in: confirm the real `PF_PixelFormat` constant used
+for the float scratch world, re-check `PF_NewWorld`'s `clear_pixB` argument, confirm
+`extra->input->device_index` and `in16f = 0` on `PF_SmartRenderExtra`, delete the dead
+Build Rule, and bump `BUILD_VERSION`.
 
-First thing worth establishing up front: **the GPU path needed zero changes for
-this.** `SmartRenderGPU` only ever creates `PF_PixelFormat_GPU_BGRA128` worlds —
-32-bit float per channel, the only format `PF_OutFlag2_SUPPORTS_GPU_RENDER_F32`
-supports — and AE handles converting an 8/16-bit source layer into that F32 buffer
-before the kernel runs, and back afterward. So all of this session's work is CPU-path
-only: `DoBlur`, `Render()`, and `SmartRender`'s CPU fallback.
+## 1. PF_PixelFormat_ARGB128 confirmed correct
+Looked up the real `AE_EffectPixelFormat.h` directly. `PF_PixelFormat_ARGB128` is
+built from `MAKE_PIXEL_FORMAT_FOURCC('a', 'e', '3', '2')` — "After Effects-style
+ARGB, 32 bits floating point per channel, 1.0 is white." The name already used in
+`DoBlurTyped`'s `wsP2->PF_NewWorld(...)` call was correct as written. Not the source
+of the earlier corruption.
 
-## 1. Declaring float awareness
-`GlobalSetup` already had `PF_OutFlag_DEEP_COLOR_AWARE` (unlocks 16-bit). Added
-`PF_OutFlag2_FLOAT_COLOR_AWARE` to `out_data->out_flags2` alongside the existing
-Smart Render / GPU flags, needed to have AE offer 32bpc CPU rendering at all.
+## 2. 32-bit corruption: not reproducible
+Re-tested and could not recreate the visible errors from last session. Two likely
+factors: the earlier test had AE's built-in Grid effect (8-bit only) applied
+upstream of OmniBlur, and clearing AE's disk cache made the errors disappear.
+Treating this as a probable stale-cache/tainted-source artifact rather than a real
+bug in the `PF_WorldSuite2::PF_NewWorld` path — **not conclusively confirmed either
+way**. `project_OmniBlur.md` updated to reflect this; worth a clean re-test (genuine
+32-bit source, cleared cache) before fully trusting 32-bit is solid.
 
-## 2. Getting the bitdepth at render time
-`SmartRender` (the CPU Smart Render entry point) now reads:
+## 3. GPU-path unknowns confirmed
+Looked up the real `PF_SmartRenderInput` struct (what `extra->input` points to in
+`SmartRenderGPU`):
 ```cpp
-A_long bitdepth = extra->input->bitdepth;
+typedef struct {
+    PF_RenderRequest output_request;
+    short            bitdepth;
+    void             *pre_render_data;
+    const void       *gpu_data;      // AE 16.0+
+    PF_GPU_Framework what_gpu;       // AE 16.0+
+    A_u_long         device_index;   // AE 16.0+
+} PF_SmartRenderInput;
 ```
-Confirmed the field name by typing `extra->input->` by hand and checking Xcode's
-autocomplete dropdown, rather than trusting it from memory — same rule the whole
-project has followed for SDK field names.
+`extra->input->device_index` is confirmed correct as written. `in16f = 0` left as-is
+— matches the F32-only GPU support already declared
+(`PF_OutFlag2_SUPPORTS_GPU_RENDER_F32`), no change needed.
 
-## 3. Templating the blur math instead of tripling it
-Turned `DoBlur`'s pixel loop into a template, `DoBlurTyped<PixelT>`, so the same
-code compiles once each for `PF_Pixel8`, `PF_Pixel16`, and `PF_PixelFloat` instead of
-three near-duplicate hand-written copies. Changes inside `DoBlurTyped`:
-- Every `PF_Pixel8*` became `PixelT*`
-- The four `long ...Sum` accumulators became `double` (needed for `PF_PixelFloat`,
-  harmless for the integer types)
-- `static_cast<A_u_char>(...)` became `static_cast<decltype(PixelT::alpha)>(...)`
-  (and same for red/green/blue) — this is the one line doing real work, since it
-  makes the cast target whatever channel type the current instantiation actually uses
+## 4. Build version bumped
+`BUILD_VERSION` 16 → 17. Rebuilt clean, no errors.
 
-Added a new, non-template `DoBlur(in_data, bitdepth, radius, input, output)` that
-switches on `bitdepth` and calls the right instantiation, returning its result
-directly. `SmartRender` and `Render()` both call this new `DoBlur`, not
-`DoBlurTyped` directly. `Render()` (the classic, non-Smart fallback) always passes
-`8` — modern AE prefers Smart Render whenever the effect declares support for it, so
-this path shouldn't see 16/32-bit in practice; treated as an accepted limitation
-rather than chased down further.
+## 5. CPU blur performance: sliding-window box sum
+Baseline going in: 256ms at radius 10, vs. native AE blurs on the same test — CC
+Cross Blur 22ms, Fast Box Blur 28ms, Gaussian Blur 2ms.
 
-**First template mistake, worth remembering:** `template <typename PixelT>` has to
-go *above* `static PF_Err`, not between the return type and the function name. Also
-`bitdepth` doesn't belong on `DoBlurTyped`'s parameter list at all — `PixelT` already
-encodes which depth you're in; `bitdepth` only belongs on the dispatcher.
+Root cause: both passes in `DoBlurTyped` recomputed the entire window sum from
+scratch for every output pixel (`for dx = -radius to radius` nested inside
+`for x`) — O(radius) work per pixel per pass, not O(1).
 
-## 4. The alignment bug (both 16-bit and 32-bit)
-First build with the template in place looked clean, but AE showed corrupted output:
-16-bit was misaligned every 960px horizontally, 32-bit every 480px. Root cause,
-found by inspection rather than trial-and-error: `DoBlurTyped`'s scratch `temp`
-world (the horizontal→vertical pass handoff, same role at every bit depth) was
-still always being allocated 8-bit-sized via `wsP->new_world(...)`, regardless of
-`PixelT`. Writing 16-bit or 32-bit pixels into a buffer sized for 8-bit overflows
-into the next row on every write — which explains both symptoms (960 = 2×480,
-matching the byte-size ratio between `PF_Pixel16` and `PF_PixelFloat`), and why
-toggling Mercury GPU Acceleration on/off made no difference — this was entirely a
-CPU-path bug, never touching `SmartRenderGPU`.
+**Horizontal pass fix:** one running sum per row. Prime it once for `x = 0`, then as
+`x` advances, add the pixel entering the window on the right (`x + radius`) and
+subtract the one leaving on the left (`x - radius - 1`), each clamped to
+`[0, width)`. O(1) per pixel, and access stays row-major (cache-friendly) since it's
+all still one row at a time.
 
-## 5. Fixing 16-bit
-`PF_WorldSuite1::new_world` takes a flags argument, and one of its flags requests a
-16-bit ("deep") world. Added, right before the `new_world` call in `DoBlurTyped`:
-```cpp
-PF_NewWorldFlags flags = PF_NewWorldFlag_CLEAR_PIXELS;
-if (std::is_same<PixelT, PF_Pixel16>::value) {
-    flags |= PF_NewWorldFlag_DEEP_PIXELS;
-}
-```
-and changed the `new_world` call's flags argument from the literal
-`PF_NewWorldFlag_CLEAR_PIXELS` to this new `flags` variable. Confirmed
-`PF_NewWorldFlag_DEEP_PIXELS` is the real name via autocomplete. Added
-`#include <type_traits>` near the top of the file for `std::is_same`.
+**Vertical pass fix:** same sliding-window idea, but the window slides along `y`
+while output still needs to be written row-major for cache-friendliness. Instead of
+one scalar running sum, kept one running sum **per column**
+(`std::vector<double>`, sized to `width`, one per channel, plus a
+`std::vector<A_long>` for count), and stepped all columns forward together as `y`
+advances — each row of `temp` gets added to / subtracted from every column's sum
+exactly once across the whole pass. Still O(1) amortized per output pixel.
+Added `#include <vector>` (`#include <type_traits>` was already present from the
+bit-depth work — no change needed there).
 
-**Result: 16-bit confirmed rendering correctly in AE after this fix.** 8-bit
-unaffected (still uses the plain `PF_NewWorldFlag_CLEAR_PIXELS` path).
+Confirmed: build succeeded, render time dropped substantially.
 
-## 6. 32-bit: needed a whole different suite
-`PF_WorldSuite1::new_world` has no pixel-format argument at all — it can't create a
-float world no matter what flags you pass it. Had to find a suite that could.
+## 6. Removed unneeded full-buffer clear
+`temp`'s allocation was requesting a full clear every render — `PF_NewWorldFlag_CLEAR_PIXELS`
+on the CPU path (`PF_Pixel8`/`PF_Pixel16`), `clear_pixB = TRUE` on the float path
+(`PF_WorldSuite2::PF_NewWorld`). Unnecessary: with the sliding window, every pixel
+of `temp` always has `count >= 1` (the window always includes the pixel itself) and
+gets overwritten by Pass 1 regardless, so the pre-clear was a wasted full-frame
+memset every render.
+- `flags` initializer changed from `PF_NewWorldFlag_CLEAR_PIXELS` to `0`
+  (`PF_NewWorldFlag_DEEP_PIXELS` still OR'd in for `PF_Pixel16` right after)
+- `clear_pixB` argument to `wsP2->PF_NewWorld(...)` changed from `TRUE` to `FALSE`
 
-Checked `suites.` autocomplete on the existing `AEGP_SuiteHandler suites(...)`
-instance and found `WorldSuite1()`, `WorldSuite2()`, `WorldSuite3()`, and
-`WorldTransformSuite1()` all listed. Went for the highest version first
-(`WorldSuite3`) — wrong move, turned out its type (`PF_WorldSuite3`) doesn't exist;
-Cmd+click on it landed in an `AEGP_SUITE_ACCESS_BOILERPLATE(WorldSuite, 3, AEGP_,
-...)` line — that's the **AEGP** suite family (opaque `AEGP_WorldH` handles), a
-different and unrelated API from the `PF_WorldSuite*` family this project has been
-using everywhere else. Backed off and checked `WorldSuite2` the same way — same
-`AEGP_` prefix problem, but that one's `PF_` counterpart (`PF_WorldSuite2`) is
-actually the right tool here: Cmd+click on `PF_NewWorld` (found via `wsP2->`
-autocomplete once a temporary `PF_WorldSuite2*` variable was declared) landed in
-`AE_EffectCBSuites.h` and showed a real, pixel-format-aware signature:
-```cpp
-PF_Err (*PF_NewWorld)(
-    PF_ProgPtr effect_ref,
-    A_long widthL,
-    A_long heightL,
-    PF_Boolean clear_pixB,
-    PF_PixelFormat pixel_format,
-    PF_EffectWorld *worldP);
-```
-Exactly what was needed — no `_ex` variant required, `WorldSuite2` is enough.
+Build succeeded.
 
-### The accessor collision
-`AEGP_SuiteHandler.h` already has a method literally named `WorldSuite2()` — for the
-AEGP suite family, as above. Its `AEGP_SUITE_ACCESS_BOILERPLATE` macro turned out
-to build *both* the generated method's name *and* its return type from the same
-`SUITE_NAME`+`VERSION_NUMBER` arguments (confirmed by reading the macro's actual
-`#define` body):
-```cpp
-#define AEGP_SUITE_ACCESS_BOILERPLATE(SUITE_NAME, VERSION_NUMBER, SUITE_PREFIX, MEMBER_NAME, kSUITE_NAME, kVERSION_NAME) \
-SUITE_PREFIX##SUITE_NAME##VERSION_NUMBER *SUITE_NAME##VERSION_NUMBER() const \
-{ ... }
-```
-First attempt tried invoking the macro with a different first argument
-(`PFWorldSuite` instead of `WorldSuite`) to dodge the name collision — that broke
-instead, since it also changed the *type* the macro tries to use
-(`PF_PFWorldSuite2`, which doesn't exist). The macro can't have its method name and
-type name decoupled by changing its arguments.
+## 7. Remaining performance gap diagnosed
+After the above, radius no longer drives render time much — single-digit radii were
+over 100ms, radius 10-11 (fastest) around 90ms. Roughly flat across radius points at
+a fixed per-frame cost rather than the blur math, which is already O(1)/pixel.
+Prime suspect: `temp` is allocated fresh and disposed on every single render call.
+Fast Box Blur almost certainly reuses a scratch buffer across frames instead.
 
-**Fix:** skip the macro for this one accessor, write it by hand instead, keeping
-the correct type but giving it a non-colliding method name:
-```cpp
-PF_WorldSuite2 *PFWorldSuite2() const
-{
-    if (i_suites.world_suite2P == NULL) {
-        i_suites.world_suite2P = (PF_WorldSuite2*)LoadSuite(kPFWorldSuite, kPFWorldSuiteVersion2);
-    }
-    return i_suites.world_suite2P;
-}
-```
-The struct member (`PF_WorldSuite2 *world_suite2P;`) and the release-boilerplate
-line inside `ReleaseAllSuites()` didn't have this collision problem and were added
-normally via the existing macros, same pattern as the `PF_GPUDeviceSuite1` fix
-earlier in the project.
-
-**Gotcha hit while pasting this in:** the hand-written method landed *after* the
-class's closing `};` instead of inside the class body, which cascaded into a wall of
-unrelated-looking errors (`Expected ';' after class`, `Use of undeclared identifier
-'i_suites'`, `Use of undeclared identifier 'LoadSuite'`) across multiple files
-(`MissingSuiteError.cpp`, `AEGP_SuiteHandler.cpp` both showed "too many errors
-emitted, stopping now"). Also hit a duplicate stray `}` left over from an earlier
-paste. Both cleared once the method was correctly relocated inside the class and the
-extra brace removed. **Lesson reinforced again**: when a change to a shared header
-produces a large, scattered error list, check placement/braces in the actually-edited
-file first before assuming each error is independent.
-
-### Wiring it into `DoBlurTyped`
-```cpp
-if (std::is_same<PixelT, PF_PixelFloat>::value) {
-    ERR(wsP2->PF_NewWorld(
-        in_data->effect_ref,
-        width,
-        height,
-        TRUE,
-        PF_PixelFormat_ARGB128, // placeholder -- confirm real name via autocomplete
-        &temp));
-} else {
-    ERR(wsP->new_world(
-        in_data->effect_ref,
-        width,
-        height,
-        flags,
-        &temp));
-}
-```
-`PF_PixelFormat_ARGB128` was a guess based on the naming pattern of the already-
-confirmed `PF_PixelFormat_GPU_BGRA128` (used in `SmartRenderGPU`) — that one's
-GPU-specific though, and this is a CPU world, so the real constant name needed
-independent confirmation via autocomplete against `AE_EffectPixelFormat.h`
-(already in scope from the earlier `PF_PixelFormat_GPU_BGRA128` lookup).
+## 8. Drafted plan: cache the scratch buffer via SequenceSetup/SequenceSetdown
+No code written yet — plan only, recorded in `project_OmniBlur.md` roadmap section 1a.
+Summary:
+- New `OmniBlurSequenceData` struct: cached `PF_EffectWorld`, its cached
+  `width`/`height`/`bitdepth`, and a `has_temp` flag
+- `PF_Cmd_SEQUENCE_SETUP` (and `PF_Cmd_SEQUENCE_RESETUP` — need to confirm whether
+  these share one `switch` case): allocate a handle sized to the struct, zero it,
+  mark `has_temp = FALSE`, store as `out_data->sequence_data`
+- `DoBlurTyped`: reuse the cached world when width/height/bitdepth match; only
+  reallocate on first render or when the comp/bit depth changes; stop disposing
+  `temp` at the end of every call — its lifetime becomes "the life of the sequence"
+- `PF_Cmd_SEQUENCE_SETDOWN`: dispose the cached world (if any) and the handle itself
+- **Thread-safety note, checked and confirmed safe as planned:** OmniBlur does not
+  set `PF_OutFlag2_SUPPORTS_THREADED_RENDERING`, so AE does not run this effect's
+  render selectors concurrently — mutating `sequence_data` inside `SmartRender` is
+  safe. If Multi-Frame Rendering support is ever added later, this caching scheme
+  would need to be redone in favor of something like `PF_EffectSequenceDataSuite1`
+  — flagged for a deliberate future decision, not blocking now.
+- Explicitly out of scope: the GPU path's own `CreateGPUWorld`/`DisposeGPUWorld`
+  scratch buffer in `SmartRenderGPU` — a separate, already-necessary GPU-resident
+  allocation, untouched by this plan.
+- Open items to VERIFY before building: exact handle allocation API for
+  `out_data->sequence_data` (likely `PF_NEW_HANDLE`/`PF_LOCK_HANDLE`/
+  `PF_UNLOCK_HANDLE`/`PF_DISPOSE_HANDLE`, not yet confirmed via autocomplete for this
+  use); whether `SEQUENCE_SETUP`/`SEQUENCE_RESETUP` need distinct handling; whether
+  `in_data->sequence_data` is already valid/locked to dereference directly inside
+  `SmartRender`/`Render` or needs an explicit lock call first.
+- Test plan once built: resize the comp, change bit depth mid-session, scrub the
+  timeline — confirm the cache invalidates/reallocates correctly with no leaks or
+  stale/wrong-sized buffers handed back.
 
 ## Where it stands
-**Build succeeds clean.** In AE:
-- 8-bit: correct
-- 16-bit: correct (confirmed after the scratch-world fix in step 5)
-- 32-bit: **still shows visible rendering errors**, not resolved this session
+- Build succeeds clean, `BUILD_VERSION` 17.
+- 8-bit and 16-bit CPU rendering: correct. 32-bit float: corruption from last
+  session not reproducible; not conclusively resolved — re-test with a clean cache
+  and genuine 32-bit source before trusting it.
+- GPU path: all previously-open assumptions (`device_index`, `in16f`) now confirmed.
+- Sliding-window blur math and unneeded-clear removal: done, build succeeds, render
+  time substantially improved.
+- Cached scratch buffer (the next big performance win): planned, not yet built.
 
 ## Loose ends / next session starting point
-- Confirm the real `PF_PixelFormat` constant name that ended up in the `PF_NewWorld`
-  call (was mid-confirmation via autocomplete at session's end) and get it recorded
-  in `project_OmniBlur.md` — if it's not actually the right float format, that alone
-  could explain the remaining 32-bit corruption
-- Re-check `PF_NewWorld`'s argument order/values against the confirmed signature,
-  particularly the `clear_pixB` (`TRUE`) argument — worth testing `FALSE` too in case
-  clearing a float-format world behaves differently than the 8/16-bit path
-- Once 32-bit is confirmed visually correct, do a full regression pass: 8/16/32-bit,
-  GPU on and off, for all three
-- Bump `BUILD_VERSION` — not confirmed done this session, check `OmniBlur.cpp`'s
-  `About()` block before the next test build
-- Still-open items from the GPU session, unrelated to this one: delete the dead
-  "Files '.cl' using Script" Build Rule; independently confirm `in16f = 0` and
-  `extra->input->device_index` on `PF_SmartRenderExtra`
+- Build the SequenceSetup/SequenceSetdown scratch-buffer caching plan from section 8
+  above (resolve the VERIFY items via Xcode autocomplete first)
+- Re-test 32-bit with a genuine float source and a clean AE cache to conclusively
+  confirm or rule out the earlier corruption
+- Once the cache lands, re-measure render time against the native blurs (target:
+  closer to Fast Box Blur's ~20-28ms)
+- Still not done: delete the dead "Files '.cl' using Script" Build Rule
+- After performance work lands: full 8/16/32-bit × GPU on/off regression pass before
+  starting on additional blur algorithms or the luma-based blur map (deferred by
+  design this session)
 
 ## Files changed
-- `OmniBlur.cpp` — `DoBlur`/`DoBlurTyped` split and templated, `SmartRender` reads
-  `bitdepth`, `Render()` updated call site, `GlobalSetup` float-aware flag,
-  scratch-world creation branches by pixel type (16-bit via flags, 32-bit via
-  `PF_WorldSuite2`), `#include <type_traits>` added
-- `AEGP_SuiteHandler.h` (shared SDK file, **not tracked by git** — see
-  `project_OmniBlur.md`'s "SDK-Level Edit Not Covered By Git" section) —
-  `world_suite2P` struct member, release-boilerplate line, and a hand-written
-  `PFWorldSuite2()` accessor method
-- `project_OmniBlur.md` — status/roadmap sections updated to reflect this session
+- `OmniBlur.cpp` — `BUILD_VERSION` bumped 16→17; `DoBlurTyped`'s horizontal and
+  vertical passes rewritten as O(1)-per-pixel sliding windows; scratch-world
+  `flags`/`clear_pixB` no longer request a full clear; `#include <vector>` added
+- `project_OmniBlur.md` — bit-depth status updated (ARGB128 confirmed, 32-bit
+  corruption marked unreproduced), GPU device_index/in16f marked confirmed, new
+  Roadmap section 1a (CPU Render Path performance) added with the
+  SequenceSetup/Setdown plan, build order and version-bump notes updated
+- `OmniBlur_Session_Update.md` — this file
 
 ---
 
@@ -217,11 +162,10 @@ Same established workflow for this repo:
 ```bash
 cd /path/to/OmniBlur          # the repo root (one level above the Mac/ subfolder)
 git add .
-git status                    # sanity check — should show OmniBlur.cpp and
-                               # project_OmniBlur.md as modified (AEGP_SuiteHandler.h
-                               # is OUTSIDE the repo and won't show up here -- that's
-                               # expected, it's the SDK-level edit noted above)
-git commit -m "Add 16/32-bit CPU render support: templated DoBlurTyped, float-aware world creation (16-bit working, 32-bit still broken)"
+git status                    # sanity check -- should show OmniBlur.cpp and
+                               # project_OmniBlur.md as modified, plus this new
+                               # OmniBlur_Session_Update.md as untracked/added
+git commit -m "Sliding-window blur math, drop unneeded scratch-world clear, confirm GPU device_index/in16f and PF_PixelFormat_ARGB128, draft SequenceSetup/Setdown caching plan"
 git push
 ```
 

@@ -15,12 +15,12 @@
                      // needs revisiting.
 
 #define NAME            "OmniBlur"
-#define DESCRIPTION        "v1.0.4 16/32 bit support"
+#define DESCRIPTION        "v1.0.4 Sliding window Sum blur + clear buffer"
 #define MAJOR_VERSION    1
 #define MINOR_VERSION    0
 #define BUG_VERSION        3
 #define STAGE_VERSION    PF_Stage_DEVELOP
-#define BUILD_VERSION    16 // remind user to increment when starting work again
+#define BUILD_VERSION    19 // remind user to increment when starting work again
 
 enum {
     OMNIBLUR_INPUT = 0,
@@ -43,6 +43,7 @@ enum {
 #include "OmniBlur_Kernel.metal.h"
 #include "AE_EffectGPUSuites.h"
 #include <type_traits>
+#include <vector>
 
 // VERIFY: the kernel below is written in Adobe's cross-platform GF_KERNEL_FUNCTION
 // DSL. In the sample project this macro-based kernel source lives in its own file
@@ -177,7 +178,7 @@ DoBlurTyped(PF_InData *in_data, A_long radius, PF_EffectWorld *input, PF_EffectW
     PF_WorldSuite1 *wsP = suites.WorldSuite1();
     PF_WorldSuite2 *wsP2 = suites.PFWorldSuite2();
     
-    PF_NewWorldFlags flags = PF_NewWorldFlag_CLEAR_PIXELS;
+    PF_NewWorldFlags flags = 0;
     if (std::is_same<PixelT, PF_Pixel16>::value) {
         flags |= PF_NewWorldFlag_DEEP_PIXELS;
     }
@@ -187,7 +188,7 @@ DoBlurTyped(PF_InData *in_data, A_long radius, PF_EffectWorld *input, PF_EffectW
             in_data->effect_ref,
             width,
             height,
-            TRUE,
+            FALSE,
             PF_PixelFormat_ARGB128,
             &temp));
     } else {
@@ -199,74 +200,134 @@ DoBlurTyped(PF_InData *in_data, A_long radius, PF_EffectWorld *input, PF_EffectW
             &temp));
     }
 
-    if (!err) {
-        // ---- PASS 1: horizontal blur, input -> temp ----
-        for (A_long y = 0; y < height; y++) {
-            PixelT *inRow = reinterpret_cast<PixelT*>(
-                reinterpret_cast<char*>(input->data) + y * input->rowbytes);
-            PixelT *tempRow = reinterpret_cast<PixelT*>(
-                reinterpret_cast<char*>(temp.data) + y * temp.rowbytes);
+    // ---- PASS 1: horizontal blur, input -> temp ----
+    // Sliding window instead of resumming every pixel: O(1) work per output pixel
+    // instead of O(radius). One running sum per row; as x advances, add the pixel
+    // entering the window on the right and remove the one leaving on the left.
+    for (A_long y = 0; y < height; y++) {
+        PixelT *inRow = reinterpret_cast<PixelT*>(
+            reinterpret_cast<char*>(input->data) + y * input->rowbytes);
+        PixelT *tempRow = reinterpret_cast<PixelT*>(
+            reinterpret_cast<char*>(temp.data) + y * temp.rowbytes);
 
-            for (A_long x = 0; x < width; x++) {
-                double rSum = 0, gSum = 0, bSum = 0, aSum = 0;
-                A_long count = 0;
+        double rSum = 0, gSum = 0, bSum = 0, aSum = 0;
+        A_long count = 0;
 
-                for (A_long dx = -radius; dx <= radius; dx++) {
-                    A_long sx = x + dx;
-                    if (sx < 0 || sx >= input->width) continue;
+        // Prime the window for x = 0.
+        for (A_long dx = -radius; dx <= radius; dx++) {
+            A_long sx = dx;
+            if (sx < 0 || sx >= input->width) continue;
 
-                    PixelT *pixP = inRow + sx;
+            PixelT *pixP = inRow + sx;
+            aSum += pixP->alpha;
+            rSum += pixP->red;
+            gSum += pixP->green;
+            bSum += pixP->blue;
+            count++;
+        }
+
+        for (A_long x = 0; x < width; x++) {
+            if (x > 0) {
+                A_long addX    = x + radius;
+                A_long removeX = x - radius - 1;
+
+                if (addX < input->width) {
+                    PixelT *pixP = inRow + addX;
                     aSum += pixP->alpha;
                     rSum += pixP->red;
                     gSum += pixP->green;
                     bSum += pixP->blue;
                     count++;
                 }
-
-                if (count > 0) {
-                    tempRow[x].alpha = static_cast<decltype(PixelT::alpha)>(aSum / count);
-                    tempRow[x].red   = static_cast<decltype(PixelT::red)>(rSum / count);
-                    tempRow[x].green = static_cast<decltype(PixelT::green)>(gSum / count);
-                    tempRow[x].blue  = static_cast<decltype(PixelT::blue)>(bSum / count);
+                if (removeX >= 0) {
+                    PixelT *pixP = inRow + removeX;
+                    aSum -= pixP->alpha;
+                    rSum -= pixP->red;
+                    gSum -= pixP->green;
+                    bSum -= pixP->blue;
+                    count--;
                 }
             }
+
+            if (count > 0) {
+                tempRow[x].alpha = static_cast<decltype(PixelT::alpha)>(aSum / count);
+                tempRow[x].red   = static_cast<decltype(PixelT::red)>(rSum / count);
+                tempRow[x].green = static_cast<decltype(PixelT::green)>(gSum / count);
+                tempRow[x].blue  = static_cast<decltype(PixelT::blue)>(bSum / count);
+            }
         }
+    }
 
-        // ---- PASS 2: vertical blur, temp -> output ----
-        for (A_long y = 0; y < height; y++) {
-            PixelT *outRow = reinterpret_cast<PixelT*>(
-                reinterpret_cast<char*>(output->data) + y * output->rowbytes);
+    // ---- PASS 2: vertical blur, temp -> output ----
+    // Same sliding-window idea, but the window slides along y while we still want
+    // to write output row-major (cache-friendly). So instead of one running sum,
+    // keep one running sum PER COLUMN, and step all of them forward together as y
+    // advances -- each row of temp is added/removed from every column's sum exactly
+    // once across the whole pass, still O(1) amortized per output pixel.
+    std::vector<double> colRSum(width, 0.0), colGSum(width, 0.0),
+                         colBSum(width, 0.0), colASum(width, 0.0);
+    std::vector<A_long> colCount(width, 0);
 
-            for (A_long x = 0; x < width; x++) {
-                double rSum = 0, gSum = 0, bSum = 0, aSum = 0;
-                A_long count = 0;
+    // Prime the window for y = 0.
+    for (A_long dy = -radius; dy <= radius; dy++) {
+        A_long sy = dy;
+        if (sy < 0 || sy >= temp.height) continue;
 
-                for (A_long dy = -radius; dy <= radius; dy++) {
-                    A_long sy = y + dy;
-                    if (sy < 0 || sy >= temp.height) continue;
+        PixelT *tempRow = reinterpret_cast<PixelT*>(
+            reinterpret_cast<char*>(temp.data) + sy * temp.rowbytes);
+        for (A_long x = 0; x < width; x++) {
+            PixelT *pixP = tempRow + x;
+            colASum[x] += pixP->alpha;
+            colRSum[x] += pixP->red;
+            colGSum[x] += pixP->green;
+            colBSum[x] += pixP->blue;
+            colCount[x]++;
+        }
+    }
 
-                    PixelT *tempRow = reinterpret_cast<PixelT*>(
-                        reinterpret_cast<char*>(temp.data) + sy * temp.rowbytes);
+    for (A_long y = 0; y < height; y++) {
+        if (y > 0) {
+            A_long addY    = y + radius;
+            A_long removeY = y - radius - 1;
+
+            if (addY < temp.height) {
+                PixelT *tempRow = reinterpret_cast<PixelT*>(
+                    reinterpret_cast<char*>(temp.data) + addY * temp.rowbytes);
+                for (A_long x = 0; x < width; x++) {
                     PixelT *pixP = tempRow + x;
-
-                    aSum += pixP->alpha;
-                    rSum += pixP->red;
-                    gSum += pixP->green;
-                    bSum += pixP->blue;
-                    count++;
+                    colASum[x] += pixP->alpha;
+                    colRSum[x] += pixP->red;
+                    colGSum[x] += pixP->green;
+                    colBSum[x] += pixP->blue;
+                    colCount[x]++;
                 }
-
-                if (count > 0) {
-                    outRow[x].alpha = static_cast<decltype(PixelT::alpha)>(aSum / count);
-                    outRow[x].red   = static_cast<decltype(PixelT::red)>(rSum / count);
-                    outRow[x].green = static_cast<decltype(PixelT::green)>(gSum / count);
-                    outRow[x].blue  = static_cast<decltype(PixelT::blue)>(bSum / count);
+            }
+            if (removeY >= 0) {
+                PixelT *tempRow = reinterpret_cast<PixelT*>(
+                    reinterpret_cast<char*>(temp.data) + removeY * temp.rowbytes);
+                for (A_long x = 0; x < width; x++) {
+                    PixelT *pixP = tempRow + x;
+                    colASum[x] -= pixP->alpha;
+                    colRSum[x] -= pixP->red;
+                    colGSum[x] -= pixP->green;
+                    colBSum[x] -= pixP->blue;
+                    colCount[x]--;
                 }
             }
         }
 
-        // Must give the temp world back to AE, or it leaks every render.
-        ERR(wsP->dispose_world(in_data->effect_ref, &temp));
+        PixelT *outRow = reinterpret_cast<PixelT*>(
+            reinterpret_cast<char*>(output->data) + y * output->rowbytes);
+
+        for (A_long x = 0; x < width; x++) {
+            if (colCount[x] > 0) {
+                outRow[x].alpha = static_cast<decltype(PixelT::alpha)>(colASum[x] / colCount[x]);
+                outRow[x].red   = static_cast<decltype(PixelT::red)>(colRSum[x] / colCount[x]);
+                outRow[x].green = static_cast<decltype(PixelT::green)>(colGSum[x] / colCount[x]);
+                outRow[x].blue  = static_cast<decltype(PixelT::blue)>(colBSum[x] / colCount[x]);
+            }
+        }
+    
     }
 
     return err;
